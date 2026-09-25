@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"name": "Hakaton",
+			"path": "../../Downloads/Hakaton/Hakaton"
+		},
+		{
+			"name": "Test",
+			"path": "../../Downloads/Hakaton/Test"
+		},
+		{
+			"name": "Py",
+			"path": "../../Downloads/Hakaton/Py"
+		},
+		{
+			"name": "project_root",
+			"path": "../../Downloads/project_root"
+		},
+		{
+			"name": "FairFlow",
+			"path": "."
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "Hakaton"
+	}
+}
