@@ -21,6 +21,7 @@ class UserSettingsModel(Base):
     max_daily_limit = Column(Integer, nullable=True)
     capacity = Column(Float, default=1.0)
     
+    # Динамические параметры, которые можно менять "на лету"
     dynamic_params = Column(JSON, default={})
     
     user = relationship("UserModel", back_populates="settings")
@@ -42,6 +43,7 @@ class OrderModel(Base):
     executor = relationship("UserModel", back_populates="orders")
 
 class MetricSnapshotModel(Base):
+    """Таблица для хранения сводных и агрегированных метрик (бонусное задание)"""
     __tablename__ = "metric_snapshots"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -51,4 +53,5 @@ class MetricSnapshotModel(Base):
     total_orders_processed = Column(Integer, default=0)
     total_orders_accepted = Column(Integer, default=0)
     
+    # Средняя нагрузка (вес) на одного исполнителя в момент среза
     average_user_load = Column(Float, default=0.0)

@@ -39,10 +39,12 @@ class BalancerService:
     async def update_users_cache(self, users: List[User], db: AsyncSession):
         async with self._lock:
             for u in users:
+                # 1. Быстрая In-Memory память
                 self.users[u.id] = u
                 self.active_slots.setdefault(u.id, 0.0)
                 self.daily_counts.setdefault(u.id, 0)
                 
+                # 2. Персистентное сохранение (SQLite)
                 result = await db.execute(
                     select(UserModel).options(selectinload(UserModel.settings)).where(UserModel.id == u.id)
                 )
@@ -102,6 +104,7 @@ class BalancerService:
                 self.daily_counts[assigned_user_id] += 1
                 self.order_history[order.id] = assigned_user_id
 
+        # Сохранение новой заявки в БД
         if assigned_user_id:
             new_order = OrderModel(
                 id=order.id,
@@ -113,6 +116,7 @@ class BalancerService:
                 status="processed",
                 dynamic_params=order.dynamic_params
             )
+            # В реальном проекте используем merge, чтобы не падать при дубликатах ID
             await db.merge(new_order)
             await db.commit()
             

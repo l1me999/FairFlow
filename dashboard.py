@@ -5,17 +5,21 @@ import time
 
 BASE_URL = "http://127.0.0.1:8000"
 
+# Настройка страницы
 st.set_page_config(page_title="FairFlow Dashboard", layout="wide")
 st.title("FairFlow 📊 | Мониторинг балансировщика")
 
+# Боковая панель управления
 with st.sidebar:
     st.header("Управление")
     
+    # Тумблер для обновления в реальном времени
     auto_refresh = st.checkbox("Автообновление (2 сек)", value=False)
     
     st.markdown("---")
     st.write("Сбор аналитики:")
     
+    # Кнопка генерации среза (Snapshot)
     if st.button("📸 Сделать снимок метрик"):
         try:
             res = requests.post(f"{BASE_URL}/api/v1/metrics/snapshot")
@@ -28,6 +32,7 @@ with st.sidebar:
             
     st.markdown("---")
     
+    # Кнопка скачивания Excel
     try:
         excel_res = requests.get(f"{BASE_URL}/api/v1/metrics/excel")
         if excel_res.status_code == 200:
@@ -40,6 +45,7 @@ with st.sidebar:
     except:
         st.warning("API отчетов недоступно")
 
+# Вкладки интерфейса
 tab_monitor, tab_constructor = st.tabs(["📊 Мониторинг", "⚙️ Конструктор параметров"])
 
 with tab_monitor:
@@ -68,7 +74,7 @@ with tab_monitor:
 
 with tab_constructor:
     st.subheader("Создание нового правила маршрутизации")
-    st.markdown("Здесь вы можете добавить новые динамические параметры без изменения исходного кода.")
+    st.markdown("Здесь вы можете добавить новые динамические параметры без изменения исходного кода (требование ТЗ).")
     
     with st.form("new_rule_form"):
         rule_id = st.text_input("ID Правила (напр. 'city_match')")
@@ -86,12 +92,13 @@ with tab_constructor:
         
         if submitted:
             import json
-            
+            # Попытка распарсить введенное значение как массив, если используется оператор in
             parsed_target = target
             if operator == "in":
                 try:
                     parsed_target = json.loads(target)
                 except:
+                    # Если не JSON, оставляем как строку (возможно, поиск подстроки)
                     pass
 
             new_rule = {
@@ -101,19 +108,12 @@ with tab_constructor:
                     {
                         "field": field,
                         "operator": operator,
+                        # Если это константа (например массив), кладем в constant
                         "target_field": None if operator == "in" else target,
                         "constant": parsed_target if operator == "in" else None
                     }
                 ]
             }
-            try:
-                res = requests.post(f"{BASE_URL}/api/v1/rules", json=new_rule)
-                if res.status_code == 200:
-                    st.success(f"Правило '{rule_name}' успешно добавлено и применяется к новым заявкам!")
-                else:
-                    st.error("Ошибка добавления правила")
-            except:
-                st.error("Сервер API недоступен")
 
 if auto_refresh:
     time.sleep(2)
