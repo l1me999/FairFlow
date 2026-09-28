@@ -10,7 +10,7 @@ import httpx
 from balancer import BalancerService, Order, User, UserSettings, ParameterDefinition
 from rule_engine import DynamicRule, Condition
 
-app = FastAPI(title="FairFlow Core API", version="1.0.0")
+app = FastAPI(title="Executor Balancer Core API", version="1.0.0")
 balancer = BalancerService()
 
 AIS_BASE_URL = "http://127.0.0.1:8001"
@@ -32,7 +32,7 @@ async def notify_ais_assignment(order_id: int, assigned_user_id: int):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "FairFlow", "ui_url": "/app"}
+    return {"status": "ok", "service": "Executor Balancer", "ui_url": "/app"}
 
 # --- СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ ---
 
@@ -145,7 +145,6 @@ async def get_metrics():
     total_assigned = sum(balancer.daily_counts.values())
     active_users = [u for u in balancer.users.values() if u.status == "active"]
     
-    # Расчет взвешенной погрешности только для исполнителей, чей суточный лимит не исчерпан
     eligible_users = [
         u for u in active_users 
         if u.settings.max_daily_limit is None or balancer.daily_counts.get(u.id, 0) < u.settings.max_daily_limit
@@ -175,7 +174,7 @@ async def get_metrics():
 @app.get("/api/v1/metrics/export/excel", summary="Выгрузка метрик в Excel (.csv с UTF-8 BOM)")
 async def export_metrics_excel():
     output = io.StringIO()
-    output.write('\ufeff')  # BOM для правильного открытия в русском Excel
+    output.write('\ufeff')
     writer = csv.writer(output, delimiter=';')
     
     writer.writerow(["ID исполнителя", "Статус", "Емкость (Capacity)", "Текущие слоты", "Заявок за день", "Лимит за день"])
@@ -218,7 +217,7 @@ async def serve_ui():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FairFlow Analytics</title>
+        <title>Executor Balancer Analytics</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
@@ -227,7 +226,7 @@ async def serve_ui():
             <!-- Шапка -->
             <header class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-200 pb-4 gap-4">
                 <div>
-                    <h1 class="text-3xl font-extrabold text-indigo-700">FairFlow</h1>
+                    <h1 class="text-3xl font-extrabold text-indigo-700">Executor Balancer</h1>
                     <p class="text-sm text-slate-500 mt-1">Интерактивный дашборд аналитики, балансировка и конструктор параметров</p>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
@@ -351,6 +350,14 @@ async def serve_ui():
                 </div>
             </div>
 
+            <!-- СПИСОК АКТИВНЫХ ПРАВИЛ -->
+            <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                <h2 class="text-md font-bold mb-3 text-slate-800">📋 Активные правила распределения</h2>
+                <div id="rulesList" class="space-y-2 text-xs">
+                    <span class="text-slate-400">Загрузка правил...</span>
+                </div>
+            </div>
+
             <!-- ТАБЛИЦА ИСПОЛНИТЕЛЕЙ -->
             <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
                 <div class="flex justify-between items-center mb-4">
@@ -422,6 +429,35 @@ async def serve_ui():
                 });
             }
 
+            async function loadRules() {
+                try {
+                    const res = await fetch('/api/v1/rules');
+                    const rules = await res.json();
+                    const container = document.getElementById('rulesList');
+                    if (!rules.length) {
+                        container.innerHTML = '<span class="text-slate-400">Нет добавленных правил (балансировка идет по текущей нагрузке и емкости)</span>';
+                        return;
+                    }
+                    container.innerHTML = rules.map(r => `
+                        <div class="flex justify-between items-center bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                            <div>
+                                <span class="font-bold text-slate-700">${r.name} (${r.id})</span>: 
+                                <span class="font-mono text-indigo-700">${r.conditions.map(c => `${c.field} ${c.operator}${c.target_field || c.constant}`).join(' AND ')}</span>
+                            </div>
+                            <button onclick="deleteRule('${r.id}')" class="text-rose-600 hover:text-rose-800 font-semibold transition">Удалить ✕</button>
+                        </div>
+                    `).join('');
+                } catch(e) {
+                    console.error("Ошибка загрузки правил:", e);
+                }
+            }
+
+            async function deleteRule(ruleId) {
+                if (!confirm(`Удалить правило ${ruleId}?`)) return;
+                await fetch(`/api/v1/rules/${ruleId}`, { method: 'DELETE' });
+                await loadRules();
+            }
+
             async function updateDashboard() {
                 try {
                     const resUsers = await fetch('/api/v1/users');
@@ -429,7 +465,6 @@ async def serve_ui():
                     const resMetrics = await fetch('/api/v1/metrics');
                     const metrics = await resMetrics.json();
 
-                    // Обновление KPI
                     document.getElementById('kpiTotal').innerText = metrics.total_assigned || 0;
                     const activeCount = users.filter(u => u.status === 'active').length;
                     document.getElementById('kpiActiveUsers').innerText = activeCount;
@@ -440,7 +475,6 @@ async def serve_ui():
                         document.getElementById('kpiAvgWeight').innerText = (sumWeights / metrics.recent_events.length).toFixed(1);
                     }
 
-                    // Обновление графиков с синхронизированными цветами
                     const labels = users.map(u => `User #${u.id}`);
                     const dailyData = users.map(u => metrics.daily_counts[u.id] || 0);
                     const slotsData = users.map(u => metrics.active_slots[u.id] || 0);
@@ -459,7 +493,6 @@ async def serve_ui():
                         slotsChartInstance.update();
                     }
 
-                    // Обновление таблицы
                     const tbody = document.getElementById('usersTable');
                     if (users.length) {
                         tbody.innerHTML = users.map(u => {
@@ -557,6 +590,7 @@ async def serve_ui():
                     body: JSON.stringify(rule)
                 });
                 document.getElementById('ruleForm').reset();
+                await loadRules();
                 alert("Правило успешно добавлено!");
             };
 
@@ -636,6 +670,7 @@ async def serve_ui():
 
             initCharts();
             updateDashboard();
+            loadRules();
             setInterval(updateDashboard, 2500);
         </script>
     </body>
