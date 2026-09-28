@@ -1,14 +1,24 @@
+from contextlib import asynccontextmanager
 from typing import List
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
 
-from balancer import BalancerService, Order, User, UserSettings
+from database import engine, Base, get_db
+from balancer import BalancerService, Order, User
 from rule_engine import DynamicRule, Condition
 
-app = FastAPI(title="Executor Balancer Core API", version="1.0.0")
+# Инициализация базы данных при старте сервера
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        print("-> Инициализация таблиц базы данных SQLite...")
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+app = FastAPI(title="Executor Balancer Core API", version="1.0.0", lifespan=lifespan)
 balancer = BalancerService()
 
-# Базовое правило: проверка вилки сумм
 active_rules: List[DynamicRule] = [
     DynamicRule(
         id="sum_range_rule",
@@ -25,18 +35,13 @@ async def root():
     return {"status": "ok", "service": "Executor Balancer"}
 
 @app.post("/api/v1/sync/users", summary="Синхронизация кэша пользователей из АИС")
-async def sync_users(users: List[User]):
-    await balancer.update_users_cache(users)
+async def sync_users(users: List[User], db: AsyncSession = Depends(get_db)):
+    await balancer.update_users_cache(users, db)
     return {"status": "ok", "synced_count": len(users)}
 
-@app.post("/api/v1/rules", summary="Добавление правила из конструктора")
-async def add_rule(rule: DynamicRule):
-    active_rules.append(rule)
-    return {"status": "ok", "rule_id": rule.id}
-
 @app.post("/api/v1/orders/distribute", summary="Распределение входящей заявки")
-async def distribute_order(order: Order):
-    executor_id = await balancer.select_executor(order, active_rules)
+async def distribute_order(order: Order, db: AsyncSession = Depends(get_db)):
+    executor_id = await balancer.select_executor(order, active_rules, db)
     if executor_id is None:
         raise HTTPException(status_code=409, detail="Подходящий исполнитель не найден или лимиты исчерпаны")
     
@@ -50,9 +55,10 @@ async def distribute_order(order: Order):
 async def release_order_slot(
     order_id: int,
     user_id: int = Query(...),
-    weight: float = Query(1.0)
+    weight: float = Query(1.0),
+    db: AsyncSession = Depends(get_db)
 ):
-    await balancer.release_slot(user_id, weight)
+    await balancer.release_slot(user_id, weight, order_id, db)
     return {"status": "ok", "order_id": order_id, "user_id": user_id}
 
 @app.get("/api/v1/metrics", summary="Метрики распределения")
