@@ -81,6 +81,15 @@ async def get_metrics():
         "daily_counts": balancer.daily_counts
     }
 
+@app.put("/api/v1/users/{user_id}", summary="Точечное обновление настроек исполнителя из АИС")
+async def update_single_user(user_id: int, user: User, db: AsyncSession = Depends(get_db)):
+    """Обновляет кэш и БД только для одного исполнителя (Требование ТЗ)"""
+    if user_id != user.id:
+        raise HTTPException(status_code=400, detail="ID в пути и теле запроса не совпадают")
+    
+    await balancer.update_users_cache([user], db)
+    return {"status": "ok", "updated_user_id": user.id}
+
 @app.post("/api/v1/metrics/snapshot", summary="Сгенерировать и сохранить срез агрегированных метрик")
 async def create_metric_snapshot(db: AsyncSession = Depends(get_db)):
     """Вычисляет сводные данные и сохраняет их в отдельную таблицу (Бонус 3)"""
