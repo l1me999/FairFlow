@@ -6,18 +6,18 @@ from rule_engine import DynamicRule, RuleEngine
 
 
 class ParameterDefinition(BaseModel):
-    name: str              # Например: "priority", "region", "category"
-    display_name: str      # "Приоритет обращения"
-    data_type: str         # "string", "number", "boolean"
-    default_value: Any     # "NORMAL", 1, False
-    entity: str = "order"  # "user", "order", "both"
+    name: str
+    display_name: str
+    data_type: str = "string"
+    default_value: Any = ""
+    entity: str = "both"  # "user", "order", "both"
 
 
 class Order(BaseModel):
     id: int
     parent_id: Optional[int] = None
-    sum: int
-    order_type: str
+    sum: int = 10000
+    order_type: str = "ORDER_1"
     weight: float = Field(default=1.0, ge=0.1)
     status: str = "processed"
     dynamic_params: Dict[str, Any] = {}
@@ -25,6 +25,8 @@ class Order(BaseModel):
 
 class UserSettings(BaseModel):
     user_id: int
+    min_accept_sum: Optional[int] = 0
+    max_accept_sum: Optional[int] = 10000000
     max_daily_limit: Optional[int] = None
     capacity: float = 1.0
     dynamic_params: Dict[str, Any] = {}
@@ -32,7 +34,7 @@ class UserSettings(BaseModel):
 
 class User(BaseModel):
     id: int
-    status: str
+    status: str = "active"
     settings: UserSettings
 
 
@@ -43,12 +45,10 @@ class BalancerService:
         self.active_slots: Dict[int, float] = {}
         self.daily_counts: Dict[int, int] = {}
         self.order_history: Dict[int, int] = {}
-        # Реестры параметров
         self.user_parameters: Dict[str, ParameterDefinition] = {}
         self.order_parameters: Dict[str, ParameterDefinition] = {}
 
     async def register_parameter(self, param: ParameterDefinition):
-        """Регистрирует параметр для исполнителей, заявок или обоих сразу."""
         async with self._lock:
             if param.entity in ("user", "both"):
                 self.user_parameters[param.name] = param
@@ -60,7 +60,6 @@ class BalancerService:
                 self.order_parameters[param.name] = param
 
     def enrich_order(self, order: Order) -> Order:
-        """Автоматически подставляет значения по умолчанию для всех зарегистрированных параметров заявки."""
         for name, param in self.order_parameters.items():
             if name not in order.dynamic_params:
                 order.dynamic_params[name] = param.default_value
@@ -72,9 +71,16 @@ class BalancerService:
                 self.users[u.id] = u
                 self.active_slots.setdefault(u.id, 0.0)
                 self.daily_counts.setdefault(u.id, 0)
-                # Проставляем зарегистрированные параметры пользователей
                 for p in self.user_parameters.values():
                     u.settings.dynamic_params.setdefault(p.name, p.default_value)
+
+    async def update_single_user(self, user: User):
+        async with self._lock:
+            self.users[user.id] = user
+            self.active_slots.setdefault(user.id, 0.0)
+            self.daily_counts.setdefault(user.id, 0)
+            for p in self.user_parameters.values():
+                user.settings.dynamic_params.setdefault(p.name, p.default_value)
 
     async def set_user_param(self, user_id: int, param_name: str, value: Any):
         async with self._lock:
@@ -84,11 +90,10 @@ class BalancerService:
     async def select_executor(
         self, order: Order, rules: List[DynamicRule]
     ) -> Optional[int]:
-        # Автоматическое обогащение параметров заявки
         order = self.enrich_order(order)
 
         async with self._lock:
-            # 1. Проверка parent_id (связанная родительская заявка)
+            # 1. Проверка parent_id
             if order.parent_id and order.parent_id in self.order_history:
                 prev_user_id = self.order_history[order.parent_id]
                 prev_user = self.users.get(prev_user_id)
@@ -97,7 +102,7 @@ class BalancerService:
                         self._assign(prev_user.id, order)
                         return prev_user.id
 
-            # 2. Фильтрация доступных кандидатов
+            # 2. Фильтрация кандидатов
             candidates = []
             for u in self.users.values():
                 if u.status != "active":
@@ -112,7 +117,7 @@ class BalancerService:
             if not candidates:
                 return None
 
-            # 3. Скоринг и взвешенная балансировка нагрузки
+            # 3. Балансировка нагрузки
             best_candidate = min(
                 candidates,
                 key=lambda u: (
@@ -130,8 +135,13 @@ class BalancerService:
         dump_user = user.model_dump() if hasattr(user, "model_dump") else user.dict()
         dump_settings = user.settings.model_dump() if hasattr(user.settings, "model_dump") else user.settings.dict()
 
+        # Объединяем поля настроек и динамических параметров на верхний уровень user для прямого доступа
         order_dict = {**dump_order, **order.dynamic_params}
-        user_dict = {**dump_user, **dump_settings, **user.settings.dynamic_params}
+        user_dict = {
+            **dump_user,
+            **dump_settings,
+            **user.settings.dynamic_params
+        }
 
         for rule in rules:
             if not RuleEngine.evaluate(rule, order_dict, user_dict):
@@ -147,3 +157,11 @@ class BalancerService:
         async with self._lock:
             if user_id in self.active_slots:
                 self.active_slots[user_id] = max(0.0, self.active_slots[user_id] - order_weight)
+
+    async def reset_all_slots(self):
+        """Полный сброс активных слотов нагрузки, суточных лимитов и истории для всех исполнителей."""
+        async with self._lock:
+            for uid in self.users.keys():
+                self.active_slots[uid] = 0.0
+                self.daily_counts[uid] = 0
+            self.order_history.clear()

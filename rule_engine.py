@@ -2,10 +2,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 class Condition(BaseModel):
-    field: str                        # Например: "order.sum" или "order.order_type"
-    operator: str                     # "==", "!=", ">", "<", ">=", "<=", "in"
-    target_field: Optional[str] = None # Было str | None
-    constant: Optional[Any] = None    # Было Any | None
+    field: str
+    operator: str
+    target_field: Optional[str] = None
+    constant: Optional[Any] = None
 
 class DynamicRule(BaseModel):
     id: str
@@ -36,22 +36,26 @@ class RuleEngine:
                 else cond.constant
             )
 
+            # Если поле не задано ни у заявки, ни у исполнителя — не блокируем заявку
             if left_val is None or right_val is None:
-                return False
+                continue
 
             op = cond.operator
-            if op == "==" and not (left_val == right_val):
-                return False
-            elif op == "!=" and not (left_val != right_val):
-                return False
-            elif op == ">" and not (left_val > right_val):
-                return False
-            elif op == "<" and not (left_val < right_val):
-                return False
-            elif op == ">=" and not (left_val >= right_val):
-                return False
-            elif op == "<=" and not (left_val <= right_val):
-                return False
-            elif op == "in" and not (left_val in right_val):
+            try:
+                if op == "==" and not (str(left_val) == str(right_val)):
+                    return False
+                elif op == "!=" and not (str(left_val) != str(right_val)):
+                    return False
+                elif op == ">" and not (float(left_val) > float(right_val)):
+                    return False
+                elif op == "<" and not (float(left_val) < float(right_val)):
+                    return False
+                elif op == ">=" and not (float(left_val) >= float(right_val)):
+                    return False
+                elif op == "<=" and not (float(left_val) <= float(right_val)):
+                    return False
+                elif op == "in" and not (left_val in right_val):
+                    return False
+            except (ValueError, TypeError):
                 return False
         return True
