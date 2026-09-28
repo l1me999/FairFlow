@@ -8,6 +8,12 @@ from database import engine, Base, get_db
 from balancer import BalancerService, Order, User
 from rule_engine import DynamicRule, Condition
 
+import io
+import pandas as pd
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select, func
+from models import UserModel, OrderModel, MetricSnapshotModel
+
 # Инициализация базы данных при старте сервера
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,6 +73,81 @@ async def get_metrics():
         "active_slots": balancer.active_slots,
         "daily_counts": balancer.daily_counts
     }
+
+@app.post("/api/v1/metrics/snapshot", summary="Сгенерировать и сохранить срез агрегированных метрик")
+async def create_metric_snapshot(db: AsyncSession = Depends(get_db)):
+    """Вычисляет сводные данные и сохраняет их в отдельную таблицу (Бонус 3)"""
+    
+    # Считаем активных пользователей
+    users_result = await db.execute(select(func.count(UserModel.id)).where(UserModel.status == "active"))
+    active_users = users_result.scalar() or 0
+
+    # Считаем заявки
+    processed_result = await db.execute(select(func.count(OrderModel.id)).where(OrderModel.status == "processed"))
+    accepted_result = await db.execute(select(func.count(OrderModel.id)).where(OrderModel.status == "accept"))
+    
+    processed_orders = processed_result.scalar() or 0
+    accepted_orders = accepted_result.scalar() or 0
+
+    # Считаем среднюю нагрузку (из кэша балансировщика)
+    total_load = sum(balancer.active_slots.values())
+    avg_load = total_load / active_users if active_users > 0 else 0.0
+
+    # Сохраняем в БД
+    snapshot = MetricSnapshotModel(
+        total_active_users=active_users,
+        total_orders_processed=processed_orders,
+        total_orders_accepted=accepted_orders,
+        average_user_load=avg_load
+    )
+    db.add(snapshot)
+    await db.commit()
+    
+    return {"status": "ok", "snapshot_id": snapshot.id}
+
+@app.get("/api/v1/metrics/excel", summary="Выгрузка метрик в Excel (Бонус 1)")
+async def export_metrics_excel(db: AsyncSession = Depends(get_db)):
+    """Генерирует Excel-файл с текущим состоянием исполнителей и заявок"""
+    
+    # 1. Запрашиваем данные из кэша балансировщика
+    users_data = []
+    for user_id, user in balancer.users.items():
+        users_data.append({
+            "ID Исполнителя": user.id,
+            "Статус": user.status,
+            "Пропускная способность": user.settings.capacity,
+            "Текущая нагрузка (Вес)": balancer.active_slots.get(user_id, 0.0),
+            "Выполнено за сегодня": balancer.daily_counts.get(user_id, 0)
+        })
+    
+    # 2. Создаем DataFrame (Pandas)
+    df = pd.DataFrame(users_data)
+    
+    # 3. Записываем в виртуальный файл (в оперативной памяти)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Нагрузка исполнителей")
+        
+        # Можем добавить второй лист с историей снэпшотов из БД
+        result = await db.execute(select(MetricSnapshotModel).order_by(MetricSnapshotModel.id.desc()).limit(100))
+        snapshots = result.scalars().all()
+        if snapshots:
+            snap_df = pd.DataFrame([{
+                "Дата/Время": s.created_at.strftime("%Y-%m-%d %H:%M:%S") if s.created_at else "",
+                "Активных юзеров": s.total_active_users,
+                "В процессе": s.total_orders_processed,
+                "Завершено": s.total_orders_accepted,
+                "Средняя нагрузка": round(s.average_user_load, 2)
+            } for s in snapshots])
+            snap_df.to_excel(writer, index=False, sheet_name="Агрегированные метрики")
+
+    output.seek(0)
+    
+    # 4. Отдаем файл клиенту
+    headers = {
+        'Content-Disposition': 'attachment; filename="fairflow_metrics.xlsx"'
+    }
+    return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

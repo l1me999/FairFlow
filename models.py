@@ -1,5 +1,6 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, JSON, DateTime
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
 from database import Base
 
 class UserModel(Base):
@@ -40,3 +41,17 @@ class OrderModel(Base):
     dynamic_params = Column(JSON, default={})
     
     executor = relationship("UserModel", back_populates="orders")
+
+class MetricSnapshotModel(Base):
+    """Таблица для хранения сводных и агрегированных метрик (бонусное задание)"""
+    __tablename__ = "metric_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    total_active_users = Column(Integer, default=0)
+    total_orders_processed = Column(Integer, default=0)
+    total_orders_accepted = Column(Integer, default=0)
+    
+    # Средняя нагрузка (вес) на одного исполнителя в момент среза
+    average_user_load = Column(Float, default=0.0)
