@@ -135,14 +135,13 @@ class BalancerService:
                 return False
         return True
 
-    async def release_slot(self, user_id: int, order_weight: float, order_id: int, db: AsyncSession):
+    async def release_slot(self, user_id: int, order_weight: float, order_id: int, final_status: str, db: AsyncSession):
         async with self._lock:
             if user_id in self.active_slots:
                 self.active_slots[user_id] = max(0.0, self.active_slots[user_id] - order_weight)
                 
-        # Меняем статус заявки в БД
         result = await db.execute(select(OrderModel).where(OrderModel.id == order_id))
         db_order = result.scalar_one_or_none()
         if db_order:
-            db_order.status = "accept"
+            db_order.status = final_status
             await db.commit()

@@ -91,6 +91,16 @@ with tab_constructor:
         submitted = st.form_submit_button("Добавить правило в ядро")
         
         if submitted:
+            import json
+            # Попытка распарсить введенное значение как массив, если используется оператор in
+            parsed_target = target
+            if operator == "in":
+                try:
+                    parsed_target = json.loads(target)
+                except:
+                    # Если не JSON, оставляем как строку (возможно, поиск подстроки)
+                    pass
+
             new_rule = {
                 "id": rule_id,
                 "name": rule_name,
@@ -98,19 +108,12 @@ with tab_constructor:
                     {
                         "field": field,
                         "operator": operator,
-                        "target_field": target,
-                        "constant": None
+                        # Если это константа (например массив), кладем в constant
+                        "target_field": None if operator == "in" else target,
+                        "constant": parsed_target if operator == "in" else None
                     }
                 ]
             }
-            try:
-                res = requests.post(f"{BASE_URL}/api/v1/rules", json=new_rule)
-                if res.status_code == 200:
-                    st.success(f"Правило '{rule_name}' успешно добавлено и применяется к новым заявкам!")
-                else:
-                    st.error("Ошибка добавления правила")
-            except:
-                st.error("Сервер API недоступен")
 
 if auto_refresh:
     time.sleep(2)

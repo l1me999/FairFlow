@@ -63,15 +63,16 @@ async def distribute_order(order: Order, db: AsyncSession = Depends(get_db)):
         "status": "assigned"
     }
 
-@app.post("/api/v1/orders/{order_id}/release", summary="Уведомление об освобождении слота")
+@app.post("/api/v1/orders/{order_id}/release")
 async def release_order_slot(
     order_id: int,
     user_id: int = Query(...),
     weight: float = Query(1.0),
+    final_status: str = Query("accept"),
     db: AsyncSession = Depends(get_db)
 ):
-    await balancer.release_slot(user_id, weight, order_id, db)
-    return {"status": "ok", "order_id": order_id, "user_id": user_id}
+    await balancer.release_slot(user_id, weight, order_id, final_status, db)
+    return {"status": "ok", "order_id": order_id}
 
 @app.get("/api/v1/metrics", summary="Метрики распределения")
 async def get_metrics():
