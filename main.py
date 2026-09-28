@@ -1,5 +1,8 @@
+import io
+import csv
+from datetime import datetime
 from typing import List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Response
 from fastapi.responses import HTMLResponse
 import uvicorn
 import httpx
@@ -13,6 +16,9 @@ balancer = BalancerService()
 AIS_BASE_URL = "http://127.0.0.1:8001"
 
 active_rules: List[DynamicRule] = []
+
+# Хранилище аналитики распределений для дашборда
+distribution_events: List[Dict[str, Any]] = []
 
 async def notify_ais_assignment(order_id: int, assigned_user_id: int):
     async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
@@ -102,6 +108,17 @@ async def distribute_order(order: Order, background_tasks: BackgroundTasks):
     if executor_id is None:
         raise HTTPException(status_code=409, detail="Подходящий исполнитель не найден или лимиты исчерпаны")
     
+    distribution_events.append({
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "order_id": order.id,
+        "assigned_user_id": executor_id,
+        "weight": order.weight,
+        "sum": order.sum,
+        "order_type": order.order_type
+    })
+    if len(distribution_events) > 500:
+        distribution_events.pop(0)
+
     background_tasks.add_task(notify_ais_assignment, order.id, executor_id)
     return {
         "order_id": order.id,
@@ -115,17 +132,81 @@ async def release_order_slot(order_id: int, user_id: int = Query(...), weight: f
     await balancer.release_slot(user_id, weight)
     return {"status": "ok", "order_id": order_id, "user_id": user_id}
 
-@app.post("/api/v1/slots/reset", summary="Сбросить все занятые слоты и суточные лимиты исполнителей")
+@app.post("/api/v1/slots/reset")
 async def reset_slots():
     await balancer.reset_all_slots()
-    return {"status": "ok", "message": "Слоты и суточные лимиты всех исполнителей сброшены в 0"}
+    distribution_events.clear()
+    return {"status": "ok", "message": "Слоты, суточные лимиты и аналитика сброшены"}
 
-@app.get("/api/v1/metrics")
+# --- МЕТРИКИ И ЭКСПОРТ (EXCEL / API) ---
+
+@app.get("/api/v1/metrics", summary="Сводные метрики распределения")
 async def get_metrics():
+    total_assigned = sum(balancer.daily_counts.values())
+    active_users = [u for u in balancer.users.values() if u.status == "active"]
+    
+    # Расчет взвешенной погрешности только для исполнителей, чей суточный лимит не исчерпан
+    eligible_users = [
+        u for u in active_users 
+        if u.settings.max_daily_limit is None or balancer.daily_counts.get(u.id, 0) < u.settings.max_daily_limit
+    ]
+    
+    fairness_deviation = 0.0
+    total_capacity = sum(u.settings.capacity for u in eligible_users)
+    eligible_orders = sum(balancer.daily_counts.get(u.id, 0) for u in eligible_users)
+
+    if len(eligible_users) > 1 and total_capacity > 0 and eligible_orders >= len(eligible_users) * 2:
+        deviations = []
+        for u in eligible_users:
+            expected = eligible_orders * (u.settings.capacity / total_capacity)
+            fact = balancer.daily_counts.get(u.id, 0)
+            if expected > 0:
+                deviations.append(abs(fact - expected) / expected)
+        fairness_deviation = round(max(deviations) * 100, 2) if deviations else 0.0
+
     return {
         "active_slots": balancer.active_slots,
-        "daily_counts": balancer.daily_counts
+        "daily_counts": balancer.daily_counts,
+        "total_assigned": total_assigned,
+        "fairness_deviation_pct": min(fairness_deviation, 100.0),
+        "recent_events": distribution_events[-20:]
     }
+
+@app.get("/api/v1/metrics/export/excel", summary="Выгрузка метрик в Excel (.csv с UTF-8 BOM)")
+async def export_metrics_excel():
+    output = io.StringIO()
+    output.write('\ufeff')  # BOM для правильного открытия в русском Excel
+    writer = csv.writer(output, delimiter=';')
+    
+    writer.writerow(["ID исполнителя", "Статус", "Емкость (Capacity)", "Текущие слоты", "Заявок за день", "Лимит за день"])
+    for u in balancer.users.values():
+        writer.writerow([
+            f"User #{u.id}",
+            u.status,
+            u.settings.capacity,
+            balancer.active_slots.get(u.id, 0.0),
+            balancer.daily_counts.get(u.id, 0),
+            u.settings.max_daily_limit if u.settings.max_daily_limit is not None else "Не ограничен"
+        ])
+    
+    writer.writerow([])
+    writer.writerow(["История последних распределений"])
+    writer.writerow(["Время", "ID заявки", "Исполнитель", "Вес заявки", "Сумма", "Тип заявки"])
+    for ev in reversed(distribution_events):
+        writer.writerow([
+            ev["timestamp"],
+            ev["order_id"],
+            f"User #{ev['assigned_user_id']}",
+            ev["weight"],
+            ev["sum"],
+            ev["order_type"]
+        ])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.ms-excel",
+        headers={"Content-Disposition": f"attachment; filename=metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
+    )
 
 # --- UI ВЕБ-ИНТЕРФЕЙС ---
 
@@ -137,29 +218,96 @@ async def serve_ui():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FairFlow</title>
+        <title>FairFlow Analytics</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
     <body class="bg-slate-50 text-slate-900 p-6 md:p-8 font-sans">
         <div class="max-w-7xl mx-auto space-y-6">
+            <!-- Шапка -->
             <header class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-200 pb-4 gap-4">
                 <div>
                     <h1 class="text-3xl font-extrabold text-indigo-700">FairFlow</h1>
-                    <p class="text-sm text-slate-500 mt-1">Центр управления балансировкой и параметрами</p>
+                    <p class="text-sm text-slate-500 mt-1">Интерактивный дашборд аналитики, балансировка и конструктор параметров</p>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
+                    <a href="/api/v1/metrics/export/excel" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-semibold transition shadow-sm flex items-center gap-1.5">
+                        <span>📊</span> Экспорт в Excel (.csv)
+                    </a>
                     <button onclick="resetAllSlots()" class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-semibold transition shadow-sm flex items-center gap-1.5">
-                        <span>⚡</span> Сбросить все слоты и лимиты
+                        <span>⚡</span> Сбросить слоты и лимиты
                     </button>
-                    <button onclick="syncFromAIS()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-semibold transition shadow-sm flex items-center gap-1.5">
-                        <span>🔄</span> Синхронизировать с АИС
+                    <button onclick="syncFromAIS()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition shadow-sm flex items-center gap-1.5">
+                        <span>🔄</span> Синхронизация с АИС
                     </button>
-                    <a href="/docs" target="_blank" class="px-3 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg text-sm font-semibold transition">Swagger API</a>
+                    <a href="/docs" target="_blank" class="px-3 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg text-sm font-semibold transition">API</a>
                 </div>
             </header>
 
+            <!-- KPI ВИДЖЕТЫ -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <span class="text-xs font-bold text-slate-400 uppercase">Всего распределено</span>
+                    <div id="kpiTotal" class="text-3xl font-extrabold text-slate-800 mt-1">0</div>
+                    <span class="text-xs text-slate-500">за текущую сессию</span>
+                </div>
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <span class="text-xs font-bold text-slate-400 uppercase">Активных специалистов</span>
+                    <div id="kpiActiveUsers" class="text-3xl font-extrabold text-indigo-600 mt-1">0</div>
+                    <span class="text-xs text-slate-500">готовы к обработке</span>
+                </div>
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <span class="text-xs font-bold text-slate-400 uppercase">Погрешность балансировки</span>
+                    <div id="kpiFairness" class="text-3xl font-extrabold text-emerald-600 mt-1">0.0%</div>
+                    <span class="text-xs text-emerald-700 font-medium">целевой диапазон ±1-2%</span>
+                </div>
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <span class="text-xs font-bold text-slate-400 uppercase">Средний вес заявки</span>
+                    <div id="kpiAvgWeight" class="text-3xl font-extrabold text-amber-500 mt-1">1.0</div>
+                    <span class="text-xs text-slate-500">сложность потока</span>
+                </div>
+            </div>
+
+            <!-- ИНТЕРАКТИВНЫЕ ГРАФИКИ -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <h3 class="font-bold text-slate-800 text-sm mb-4 flex items-center gap-2">
+                        <span>📈</span> Распределение заявок по исполнителям (Факт vs Емкость)
+                    </h3>
+                    <div class="h-64">
+                        <canvas id="loadChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <h3 class="font-bold text-slate-800 text-sm mb-4 flex items-center gap-2">
+                        <span>⏱️</span> Текущая загрузка специалистов (Активные слоты)
+                    </h3>
+                    <div class="h-64">
+                        <canvas id="slotsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ТЕСТОВАЯ ЗАЯВКА -->
+            <div class="bg-indigo-50/70 p-4 rounded-2xl border border-indigo-100 flex flex-col md:flex-row justify-between items-center gap-3">
+                <div>
+                    <h3 class="font-bold text-indigo-950 text-sm">🚀 Тестовое распределение заявки</h3>
+                    <p class="text-xs text-indigo-700">Передайте динамические параметры заявки в формате JSON (например: {"priority": "NORMAL"})</p>
+                </div>
+                <div class="flex items-center gap-2 w-full md:w-auto">
+                    <input type="text" id="testOrderParams" placeholder='{"priority": "NORMAL"}' value='{"priority": "NORMAL"}' 
+                           class="border border-indigo-200 p-2 rounded-lg text-xs font-mono outline-none w-52 bg-white">
+                    <button onclick="sendTestOrder()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition shrink-0">
+                        Отправить заявку
+                    </button>
+                </div>
+            </div>
+            <div id="testOrderResult" class="text-xs font-mono font-semibold px-2"></div>
+
+            <!-- КОНСТРУКТОР ПАРАМЕТРОВ И ПРАВИЛ -->
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- Параметры заявки -->
+                <!-- Параметр заявки -->
                 <div class="bg-white p-5 rounded-2xl shadow-sm border border-indigo-100">
                     <h2 class="text-md font-bold mb-3 text-indigo-700">📝 Параметр заявки</h2>
                     <form id="orderParamForm" class="space-y-3">
@@ -171,7 +319,7 @@ async def serve_ui():
                     <div id="orderParamsList" class="flex flex-wrap gap-1 mt-3"></div>
                 </div>
 
-                <!-- Параметры исполнителя -->
+                <!-- Параметр исполнителя -->
                 <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <h2 class="text-md font-bold mb-3 text-slate-800">👥 Параметр исполнителя</h2>
                     <form id="userParamForm" class="space-y-3">
@@ -203,32 +351,10 @@ async def serve_ui():
                 </div>
             </div>
 
-            <!-- Тест распределения с возможностью передать JSON параметров -->
-            <div class="bg-indigo-50/70 p-4 rounded-2xl border border-indigo-100 flex flex-col md:flex-row justify-between items-center gap-3">
-                <div>
-                    <h3 class="font-bold text-indigo-950 text-sm">🚀 Тестовая заявка</h3>
-                    <p class="text-xs text-indigo-700">Укажите динамические параметры заявки в формате JSON (например: {"priority": "HIGH"})</p>
-                </div>
-                <div class="flex items-center gap-2 w-full md:w-auto">
-                    <input type="text" id="testOrderParams" placeholder='{"priority": "HIGH"}' value='{"priority": "HIGH"}' 
-                           class="border border-indigo-200 p-2 rounded-lg text-xs font-mono outline-none w-52 bg-white">
-                    <button onclick="sendTestOrder()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition shrink-0">
-                        Отправить заявку
-                    </button>
-                </div>
-            </div>
-            <div id="testOrderResult" class="text-xs font-mono font-semibold px-2"></div>
-
-            <!-- Список правил -->
-            <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
-                <h2 class="text-md font-bold mb-3 text-slate-800">📋 Активные правила</h2>
-                <div id="rulesList" class="space-y-2 text-xs"></div>
-            </div>
-
-            <!-- Таблица исполнителей -->
+            <!-- ТАБЛИЦА ИСПОЛНИТЕЛЕЙ -->
             <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
                 <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-lg font-bold text-slate-800">👥 Кэш исполнителей</h2>
+                    <h2 class="text-lg font-bold text-slate-800">👥 Статус и квоты исполнителей</h2>
                     <span id="syncNotice" class="text-xs font-medium text-emerald-600"></span>
                 </div>
                 <div class="overflow-x-auto">
@@ -237,6 +363,7 @@ async def serve_ui():
                             <tr class="bg-slate-100 border-b text-xs font-semibold text-slate-600">
                                 <th class="p-3">ID</th>
                                 <th class="p-3">Статус</th>
+                                <th class="p-3">Емкость (Capacity)</th>
                                 <th class="p-3">Нагрузка (слоты)</th>
                                 <th class="p-3">Лимит за день (факт / макс)</th>
                                 <th class="p-3">Параметры</th>
@@ -244,7 +371,7 @@ async def serve_ui():
                             </tr>
                         </thead>
                         <tbody id="usersTable" class="divide-y divide-slate-100">
-                            <tr><td colspan="6" class="p-6 text-center text-slate-400">Нет исполнителей</td></tr>
+                            <tr><td colspan="7" class="p-6 text-center text-slate-400">Нет исполнителей</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -252,19 +379,138 @@ async def serve_ui():
         </div>
 
         <script>
-            async function resetAllSlots() {
-                if (!confirm("Вы уверены, что хотите сбросить текущую нагрузку и суточные лимиты всех исполнителей?")) return;
+            let loadChartInstance = null;
+            let slotsChartInstance = null;
+            const CHART_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+
+            function initCharts() {
+                const ctxLoad = document.getElementById('loadChart').getContext('2d');
+                loadChartInstance = new Chart(ctxLoad, {
+                    type: 'bar',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: 'Назначено заявок (факт)',
+                            data: [],
+                            backgroundColor: CHART_COLORS,
+                            borderRadius: 6
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: { y: { beginAtZero: true } }
+                    }
+                });
+
+                const ctxSlots = document.getElementById('slotsChart').getContext('2d');
+                slotsChartInstance = new Chart(ctxSlots, {
+                    type: 'doughnut',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            data: [],
+                            backgroundColor: CHART_COLORS
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: 'bottom' } }
+                    }
+                });
+            }
+
+            async function updateDashboard() {
                 try {
-                    const res = await fetch('/api/v1/slots/reset', { method: 'POST' });
-                    if (res.ok) {
-                        alert("Слоты и суточные лимиты успешно обнулены!");
-                        await loadUsers();
-                    } else {
-                        alert("Ошибка при сбросе слотов");
+                    const resUsers = await fetch('/api/v1/users');
+                    const users = await resUsers.json();
+                    const resMetrics = await fetch('/api/v1/metrics');
+                    const metrics = await resMetrics.json();
+
+                    // Обновление KPI
+                    document.getElementById('kpiTotal').innerText = metrics.total_assigned || 0;
+                    const activeCount = users.filter(u => u.status === 'active').length;
+                    document.getElementById('kpiActiveUsers').innerText = activeCount;
+                    document.getElementById('kpiFairness').innerText = (metrics.fairness_deviation_pct || 0) + '%';
+
+                    if (metrics.recent_events && metrics.recent_events.length > 0) {
+                        const sumWeights = metrics.recent_events.reduce((acc, ev) => acc + (ev.weight || 1.0), 0);
+                        document.getElementById('kpiAvgWeight').innerText = (sumWeights / metrics.recent_events.length).toFixed(1);
+                    }
+
+                    // Обновление графиков с синхронизированными цветами
+                    const labels = users.map(u => `User #${u.id}`);
+                    const dailyData = users.map(u => metrics.daily_counts[u.id] || 0);
+                    const slotsData = users.map(u => metrics.active_slots[u.id] || 0);
+
+                    if (loadChartInstance) {
+                        loadChartInstance.data.labels = labels;
+                        loadChartInstance.data.datasets[0].data = dailyData;
+                        loadChartInstance.data.datasets[0].backgroundColor = labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]);
+                        loadChartInstance.update();
+                    }
+
+                    if (slotsChartInstance) {
+                        slotsChartInstance.data.labels = labels;
+                        slotsChartInstance.data.datasets[0].data = slotsData.length && slotsData.some(v => v > 0) ? slotsData : [1];
+                        slotsChartInstance.data.datasets[0].backgroundColor = labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]);
+                        slotsChartInstance.update();
+                    }
+
+                    // Обновление таблицы
+                    const tbody = document.getElementById('usersTable');
+                    if (users.length) {
+                        tbody.innerHTML = users.map(u => {
+                            const slots = (metrics.active_slots && metrics.active_slots[u.id]) || 0;
+                            const daily = (metrics.daily_counts && metrics.daily_counts[u.id]) || 0;
+                            const maxLimit = (u.settings.max_daily_limit !== null && u.settings.max_daily_limit !== undefined) 
+                                ? u.settings.max_daily_limit : '∞';
+
+                            const isLimitReached = (maxLimit !== '∞' && daily >= maxLimit);
+
+                            let statusBadge;
+                            if (u.status !== 'active') {
+                                statusBadge = `<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-rose-100 text-rose-800">inactive</span>`;
+                            } else if (isLimitReached) {
+                                statusBadge = `<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">лимит исчерпан</span>`;
+                            } else {
+                                statusBadge = `<span class="px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">active</span>`;
+                            }
+
+                            const slotBadge = slots > 0 
+                                ? `<span class="px-2 py-0.5 rounded font-bold bg-amber-100 text-amber-900">${slots}</span>` 
+                                : `<span class="text-slate-400">0</span>`;
+
+                            const limitBadge = isLimitReached
+                                ? `<span class="px-2 py-0.5 rounded font-bold bg-rose-100 text-rose-800">${daily} / ${maxLimit}</span>`
+                                : `<span class="font-medium text-slate-700">${daily} / ${maxLimit}</span>`;
+
+                            return `
+                            <tr>
+                                <td class="p-3 font-semibold">User #${u.id}</td>
+                                <td class="p-3">${statusBadge}</td>
+                                <td class="p-3 font-semibold">${u.settings.capacity || 1.0}</td>
+                                <td class="p-3">${slotBadge}</td>
+                                <td class="p-3 text-xs">${limitBadge}</td>
+                                <td class="p-3 font-mono text-xs"><pre class="bg-slate-50 p-1.5 rounded">${JSON.stringify(u.settings.dynamic_params || {}, null, 2)}</pre></td>
+                                <td class="p-3 text-right">
+                                    <button onclick="editParam(${u.id})" class="text-indigo-600 hover:underline text-xs font-semibold">Изменить</button>
+                                </td>
+                            </tr>
+                            `;
+                        }).join('');
                     }
                 } catch (e) {
-                    alert("Ошибка соединения: " + e);
+                    console.error("Dashboard error:", e);
                 }
+            }
+
+            async function resetAllSlots() {
+                if (!confirm("Сбросить текущую нагрузку, лимиты и историю всех специалистов?")) return;
+                await fetch('/api/v1/slots/reset', { method: 'POST' });
+                await updateDashboard();
             }
 
             async function syncFromAIS() {
@@ -275,81 +521,13 @@ async def serve_ui():
                     const data = await res.json();
                     if (res.ok) {
                         notice.innerText = `✅ Загружено ${data.synced_count} исполнителей из АИС!`;
-                        await loadUsers();
+                        await updateDashboard();
                     } else {
                         notice.innerText = `❌ Ошибка: ${data.detail}`;
                     }
                 } catch(e) {
-                    notice.innerText = "❌ АИС недоступна. Запустите ais_mock.py";
+                    notice.innerText = "❌ АИС недоступна на порту 8001";
                 }
-            }
-
-            async function loadRules() {
-                const res = await fetch('/api/v1/rules');
-                const rules = await res.json();
-                const container = document.getElementById('rulesList');
-                if (!rules.length) {
-                    container.innerHTML = '<span class="text-slate-400">Нет добавленных правил (балансировка по текущей нагрузке и емкости)</span>';
-                    return;
-                }
-                container.innerHTML = rules.map(r => `
-                    <div class="flex justify-between items-center bg-slate-50 p-2.5 rounded-lg border border-slate-200">
-                        <div>
-                            <span class="font-bold text-slate-700">${r.name} (${r.id})</span>: 
-                            <span class="font-mono text-indigo-700">${r.conditions.map(c => `${c.field} ${c.operator}${c.target_field || c.constant}`).join(' AND ')}</span>
-                        </div>
-                        <button onclick="deleteRule('${r.id}')" class="text-rose-600 hover:text-rose-800 font-semibold">Удалить ✕</button>
-                    </div>
-                `).join('');
-            }
-
-            async function deleteRule(ruleId) {
-                await fetch(`/api/v1/rules/${ruleId}`, { method: 'DELETE' });
-                await loadRules();
-            }
-
-            async function loadUsers() {
-                try {
-                    const res = await fetch('/api/v1/users');
-                    const users = await res.json();
-                    const metricsRes = await fetch('/api/v1/metrics');
-                    const metrics = await metricsRes.json();
-                    const tbody = document.getElementById('usersTable');
-                    if (!users.length) return;
-
-                    tbody.innerHTML = users.map(u => {
-                        const slots = (metrics.active_slots && metrics.active_slots[u.id]) || 0;
-                        const daily = (metrics.daily_counts && metrics.daily_counts[u.id]) || 0;
-                        const maxLimit = (u.settings.max_daily_limit !== null && u.settings.max_daily_limit !== undefined) 
-                            ? u.settings.max_daily_limit 
-                            : '∞';
-
-                        const slotBadge = slots > 0 
-                            ? `<span class="px-2 py-0.5 rounded font-bold bg-amber-100 text-amber-900">${slots}</span>` 
-                            : `<span class="text-slate-400">0</span>`;
-
-                        const limitBadge = (maxLimit !== '∞' && daily >= maxLimit)
-                            ? `<span class="px-2 py-0.5 rounded font-bold bg-rose-100 text-rose-800">${daily} / ${maxLimit} (исчерпан)</span>`
-                            : `<span class="font-medium text-slate-700">${daily} / ${maxLimit}</span>`;
-
-                        return `
-                        <tr>
-                            <td class="p-3 font-semibold">User #${u.id}</td>
-                            <td class="p-3">
-                                <span class="px-2 py-0.5 rounded-full text-xs font-medium ${u.status === 'active' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">
-                                    ${u.status}
-                                </span>
-                            </td>
-                            <td class="p-3">${slotBadge}</td>
-                            <td class="p-3 text-xs">${limitBadge}</td>
-                            <td class="p-3 font-mono text-xs"><pre class="bg-slate-50 p-1.5 rounded">${JSON.stringify(u.settings.dynamic_params || {}, null, 2)}</pre></td>
-                            <td class="p-3 text-right">
-                                <button onclick="editParam(${u.id})" class="text-indigo-600 hover:underline text-xs font-semibold">Изменить</button>
-                            </td>
-                        </tr>
-                        `;
-                    }).join('');
-                } catch(e) {}
             }
 
             async function editParam(userId) {
@@ -358,7 +536,7 @@ async def serve_ui():
                 const val = prompt(`Новое значение для User #${userId}:`);
                 if (val === null) return;
                 await fetch(`/api/v1/users/${userId}/param?param_name=${encodeURIComponent(name)}&value=${encodeURIComponent(val)}`, { method: 'POST' });
-                loadUsers();
+                updateDashboard();
             }
 
             document.getElementById('ruleForm').onsubmit = async (e) => {
@@ -379,7 +557,7 @@ async def serve_ui():
                     body: JSON.stringify(rule)
                 });
                 document.getElementById('ruleForm').reset();
-                await loadRules();
+                alert("Правило успешно добавлено!");
             };
 
             document.getElementById('orderParamForm').onsubmit = async (e) => {
@@ -397,6 +575,7 @@ async def serve_ui():
                     body: JSON.stringify(payload)
                 });
                 document.getElementById('orderParamForm').reset();
+                alert("Параметр добавлен в схему заявок!");
             };
 
             document.getElementById('userParamForm').onsubmit = async (e) => {
@@ -414,7 +593,8 @@ async def serve_ui():
                     body: JSON.stringify(payload)
                 });
                 document.getElementById('userParamForm').reset();
-                await loadUsers();
+                await updateDashboard();
+                alert("Параметр применен ко всем исполнителям!");
             };
 
             async function sendTestOrder() {
@@ -446,17 +626,17 @@ async def serve_ui():
 
                 if (res.ok) {
                     const data = await res.json();
-                    resBox.innerHTML = `<span class="text-emerald-700">✅ Назначен <b>User #${data.assigned_user_id}</b> (Параметры: ${JSON.stringify(data.applied_order_params)})</span>`;
+                    resBox.innerHTML = `<span class="text-emerald-700">✅ Назначен <b>User #${data.assigned_user_id}</b></span>`;
                 } else {
                     const err = await res.json();
                     resBox.innerHTML = `<span class="text-rose-600">❌ ${err.detail}</span>`;
                 }
-                await loadUsers();
+                await updateDashboard();
             }
 
-            loadUsers();
-            loadRules();
-            setInterval(loadUsers, 3000);
+            initCharts();
+            updateDashboard();
+            setInterval(updateDashboard, 2500);
         </script>
     </body>
     </html>

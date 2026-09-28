@@ -131,3 +131,5 @@ async def get_orders():
 
 if __name__ == "__main__":
     uvicorn.run("ais_mock:app", host="127.0.0.1", port=8001, reload=True)
+
+# python ais_mock.py    
