@@ -2,10 +2,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 class Condition(BaseModel):
-    field: str                        # Например: "order.sum" или "order.order_type"
-    operator: str                     # "==", "!=", ">", "<", ">=", "<=", "in"
-    target_field: Optional[str] = None # Было str | None
-    constant: Optional[Any] = None    # Было Any | None
+    field: str
+    operator: str
+    target_field: Optional[str] = None
+    constant: Optional[Any] = None
 
 class DynamicRule(BaseModel):
     id: str
