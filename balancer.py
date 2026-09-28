@@ -4,6 +4,12 @@ from pydantic import BaseModel, Field
 
 from rule_engine import DynamicRule, RuleEngine
 
+class ParameterDefinition(BaseModel):
+    name: str              # например, "category" или "vip"
+    display_name: str      # "Категория обращений"
+    data_type: str         # "string", "number", "boolean", "list"
+    default_value: Any     # Значение по умолчанию для всех: "STANDARD", 0, false и т.д.
+    entity: str = "both"   # "user", "order", "both"
 
 class Order(BaseModel):
     id: int
@@ -32,10 +38,33 @@ class BalancerService:
     def __init__(self):
         self._lock = asyncio.Lock()
         self.users: Dict[int, User] = {}
-        # Локальный кэш состояния для предотвращения Race Conditions
-        self.active_slots: Dict[int, float] = {}       # user_id -> суммарный вес открытых задач
-        self.daily_counts: Dict[int, int] = {}         # user_id -> кол-во выполненных/назначенных задач
-        self.order_history: Dict[int, int] = {}        # order_id -> user_id
+        self.active_slots: Dict[int, float] = {}
+        self.daily_counts: Dict[int, int] = {}
+        self.order_history: Dict[int, int] = {}
+        # Реестр доступных параметров
+        self.parameters: Dict[str, ParameterDefinition] = {}
+
+    async def register_parameter(self, param: ParameterDefinition):
+        """Регистрирует новый параметр и автоматически проставляет default_value всем существующим исполнителям."""
+        async with self._lock:
+            self.parameters[param.name] = param
+            # Автоматически проставляем параметр всем исполнителям в кэше
+            if param.entity in ("user", "both"):
+                for u in self.users.values():
+                    if param.name not in u.settings.dynamic_params:
+                        u.settings.dynamic_params[param.name] = param.default_value
+
+    async def set_user_param(self, user_id: int, param_name: str, value: Any):
+        """Точечное изменение значения параметра конкретного исполнителя через интерфейс."""
+        async with self._lock:
+            if user_id in self.users:
+                self.users[user_id].settings.dynamic_params[param_name] = value
+
+    async def batch_set_param(self, param_name: str, value: Any):
+        """Массовое присвоение нового значения параметра абсолютно всем исполнителям."""
+        async with self._lock:
+            for u in self.users.values():
+                u.settings.dynamic_params[param_name] = value
 
     async def update_users_cache(self, users: List[User]):
         async with self._lock:
