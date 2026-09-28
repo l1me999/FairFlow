@@ -14,7 +14,6 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
 from models import UserModel, OrderModel, MetricSnapshotModel
 
-# Инициализация базы данных при старте сервера
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
@@ -42,7 +41,6 @@ async def root():
 
 @app.post("/api/v1/rules", summary="Добавление правила из конструктора")
 async def add_rule(rule: DynamicRule):
-    """Эндпоинт для динамического добавления новых правил маршрутизации"""
     active_rules.append(rule)
     return {"status": "ok", "rule_id": rule.id}
 
@@ -83,7 +81,6 @@ async def get_metrics():
 
 @app.put("/api/v1/users/{user_id}", summary="Точечное обновление настроек исполнителя из АИС")
 async def update_single_user(user_id: int, user: User, db: AsyncSession = Depends(get_db)):
-    """Обновляет кэш и БД только для одного исполнителя (Требование ТЗ)"""
     if user_id != user.id:
         raise HTTPException(status_code=400, detail="ID в пути и теле запроса не совпадают")
     
@@ -92,24 +89,18 @@ async def update_single_user(user_id: int, user: User, db: AsyncSession = Depend
 
 @app.post("/api/v1/metrics/snapshot", summary="Сгенерировать и сохранить срез агрегированных метрик")
 async def create_metric_snapshot(db: AsyncSession = Depends(get_db)):
-    """Вычисляет сводные данные и сохраняет их в отдельную таблицу (Бонус 3)"""
-    
-    # Считаем активных пользователей
     users_result = await db.execute(select(func.count(UserModel.id)).where(UserModel.status == "active"))
     active_users = users_result.scalar() or 0
 
-    # Считаем заявки
     processed_result = await db.execute(select(func.count(OrderModel.id)).where(OrderModel.status == "processed"))
     accepted_result = await db.execute(select(func.count(OrderModel.id)).where(OrderModel.status == "accept"))
     
     processed_orders = processed_result.scalar() or 0
     accepted_orders = accepted_result.scalar() or 0
 
-    # Считаем среднюю нагрузку (из кэша балансировщика)
     total_load = sum(balancer.active_slots.values())
     avg_load = total_load / active_users if active_users > 0 else 0.0
 
-    # Сохраняем в БД
     snapshot = MetricSnapshotModel(
         total_active_users=active_users,
         total_orders_processed=processed_orders,
@@ -121,11 +112,8 @@ async def create_metric_snapshot(db: AsyncSession = Depends(get_db)):
     
     return {"status": "ok", "snapshot_id": snapshot.id}
 
-@app.get("/api/v1/metrics/excel", summary="Выгрузка метрик в Excel (Бонус 1)")
+@app.get("/api/v1/metrics/excel", summary="Выгрузка метрик в Excel")
 async def export_metrics_excel(db: AsyncSession = Depends(get_db)):
-    """Генерирует Excel-файл с текущим состоянием исполнителей и заявок"""
-    
-    # 1. Запрашиваем данные из кэша балансировщика
     users_data = []
     for user_id, user in balancer.users.items():
         users_data.append({
@@ -136,15 +124,12 @@ async def export_metrics_excel(db: AsyncSession = Depends(get_db)):
             "Выполнено за сегодня": balancer.daily_counts.get(user_id, 0)
         })
     
-    # 2. Создаем DataFrame (Pandas)
     df = pd.DataFrame(users_data)
     
-    # 3. Записываем в виртуальный файл (в оперативной памяти)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Нагрузка исполнителей")
         
-        # Можем добавить второй лист с историей снэпшотов из БД
         result = await db.execute(select(MetricSnapshotModel).order_by(MetricSnapshotModel.id.desc()).limit(100))
         snapshots = result.scalars().all()
         if snapshots:
@@ -159,7 +144,6 @@ async def export_metrics_excel(db: AsyncSession = Depends(get_db)):
 
     output.seek(0)
     
-    # 4. Отдаем файл клиенту
     headers = {
         'Content-Disposition': 'attachment; filename="fairflow_metrics.xlsx"'
     }
