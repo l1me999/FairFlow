@@ -40,6 +40,12 @@ active_rules: List[DynamicRule] = [
 async def root():
     return {"status": "ok", "service": "Executor Balancer"}
 
+@app.post("/api/v1/rules", summary="Добавление правила из конструктора")
+async def add_rule(rule: DynamicRule):
+    """Эндпоинт для динамического добавления новых правил маршрутизации"""
+    active_rules.append(rule)
+    return {"status": "ok", "rule_id": rule.id}
+
 @app.post("/api/v1/sync/users", summary="Синхронизация кэша пользователей из АИС")
 async def sync_users(users: List[User], db: AsyncSession = Depends(get_db)):
     await balancer.update_users_cache(users, db)
